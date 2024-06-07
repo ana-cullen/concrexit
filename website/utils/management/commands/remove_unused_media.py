@@ -2,11 +2,14 @@ import os
 
 from django.apps import apps
 from django.conf import settings
-from django.core.files.storage import DefaultStorage, storages
+from django.core.files.storage import storages
 from django.core.management.base import BaseCommand
 from django.core.validators import EMPTY_VALUES
 from django.db import models
 from django.utils import timezone
+
+from thumbnails.fields import ImageField as ThumbnailImageField
+from thumbnails.models import Source, ThumbnailMeta
 
 
 def get_file_fields():
@@ -51,13 +54,27 @@ def get_used_media(storage):
         if not isinstance(field.storage, type(storage)):
             continue
 
+        field_media = set()
+
         for value in (
             field.model._base_manager.values_list(field.name, flat=True)
             .exclude(**is_empty)
             .exclude(**is_null)
         ):
             if value not in EMPTY_VALUES:
-                media.add(value)
+                field_media.add(value)
+
+        # Add thumbnails beloning to the field.
+        if isinstance(field, ThumbnailImageField):
+            field_media.update(
+                set(
+                    ThumbnailMeta.objects.filter(
+                        source__name__in=field_media
+                    ).values_list("name", flat=True)
+                )
+            )
+
+        media.update(field_media)
 
     return media
 
@@ -67,7 +84,7 @@ def get_all_media(storage, minimum_file_age=None, folder=""):
     initial_time = timezone.now()
 
     if not storage.exists(folder):
-        return []
+        return set()
 
     dirs, files = storage.listdir(folder)
 
@@ -82,11 +99,10 @@ def get_all_media(storage, minimum_file_age=None, folder=""):
         name = os.path.join(folder, name)
         if minimum_file_age:
             file_age = initial_time - storage.get_modified_time(name)
-
             if file_age.total_seconds() < minimum_file_age:
                 continue
-        else:
-            media.add(name)
+
+        media.add(name)
 
     for name in dirs:
         media.update(
@@ -101,6 +117,17 @@ def get_unused_media(storage, minimum_file_age=None):
     used_media = get_used_media(storage)
 
     return all_media - used_media
+
+
+def delete_nonexisting_thumbnails_source(storages):
+    """Remove thumbnails.models.Source objects for non-existing files.
+
+    The django-thumbnails package does not do this automatically...
+    """
+    all_media = set.union(*(get_all_media(storage) for storage in storages))
+    for source in Source.objects.all():
+        if source.name not in all_media:
+            source.delete()
 
 
 class Command(BaseCommand):
@@ -144,7 +171,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         verbosity = options.get("verbosity")
 
-        private_storage = DefaultStorage()
+        private_storage = storages["default"]
         unused_private_media = get_unused_media(
             private_storage,
             minimum_file_age=options.get("minimum_file_age"),
@@ -166,11 +193,15 @@ class Command(BaseCommand):
             self.stdout.write("Dry run. Exit.")
             return
 
+        num_files = len(unused_private_media) + len(unused_public_media)
+
         if options.get("interactive"):
             self._show_files_to_delete("private", unused_private_media, verbosity)
             self._show_files_to_delete("public", unused_public_media, verbosity)
 
-            question = f"Are you sure you want to remove {len(unused_private_media) + len(unused_public_media)} unused files? (y/N)"
+            question = (
+                f"Are you sure you want to remove {num_files} unused files? (y/N)"
+            )
 
             if input(question).upper() != "Y":
                 self.stdout.write("Interrupted by user. Exit.")
@@ -182,8 +213,8 @@ class Command(BaseCommand):
         for f in unused_public_media:
             public_storage.delete(f)
 
+        delete_nonexisting_thumbnails_source([private_storage, public_storage])
+
         remove_empty_dirs()
 
-        self.stdout.write(
-            f"Done. Total files removed: {len(unused_private_media) + len(unused_public_media)}"
-        )
+        self.stdout.write(f"Done. Total files removed: {num_files}")
